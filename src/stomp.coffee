@@ -343,6 +343,10 @@ class Client
     @escapeHeaderValues = false
     out = @_parseConnect(args...)
     [@headers, @connectCallback, @errorCallback] = out
+
+    # Indicate that this connection is active (it will keep trying to connect)
+    @_active = true
+
     @_connect()
 
   # Refactored to make it callable multiple times, useful for reconnecting
@@ -388,6 +392,12 @@ class Client
             # STOMP version 1.2 needs header values to be escaped
             if @version == Stomp.VERSIONS.V1_2
               @escapeHeaderValues = true
+
+            # If a disconnect was requested while I was connecting, issue a disconnect
+            unless @_active
+              @disconnect()
+              return
+
             @_setupHeartbeat(frame.headers)
             @connectCallback? frame
           # [MESSAGE Frame](http://stomp.github.com/stomp-specification-1.2.html#MESSAGE)
@@ -434,6 +444,7 @@ class Client
               @ws.onclose = null
               @ws.close()
               @_cleanUp()
+              @_disconnectCallback?()
             else
               @onreceipt?(frame)
           # [ERROR Frame](http://stomp.github.com/stomp-specification-1.2.html#ERROR)
@@ -460,7 +471,7 @@ class Client
     if @reconnect_delay > 0
       @debug?("STOMP: scheduling reconnection in #{@reconnect_delay}ms")
       # setTimeout is available in both Browser and Node.js environments
-      setTimeout(=>
+      @_reconnector = setTimeout(=>
         if @connected
           @debug?('STOMP: already connected')
         else
@@ -473,20 +484,33 @@ class Client
   # Disconnect from the STOMP broker. To ensure graceful shutdown it sends a DISCONNECT Frame
   # and wait till the broker acknowledges.
   #
+  # disconnectCallback will be called only if the broker was actually connected.
+  #
   # @param disconnectCallback [function()]
   # @param headers [Object] optional
   disconnect: (disconnectCallback, headers={}) ->
-    unless headers.receipt
-      headers.receipt = "close-" + @counter++
-    @closeReceipt = headers.receipt
-    @_transmit "DISCONNECT", headers
-    disconnectCallback?()
+    @_disconnectCallback = disconnectCallback
+
+    # indicate that auto reconnect loop should terminate
+    @_active = false
+
+    if @connected
+      unless headers.receipt
+        headers.receipt = "close-" + @counter++
+      @closeReceipt = headers.receipt
+      try
+        @_transmit "DISCONNECT", headers
+      catch error
+        @debug?('Ignoring error during disconnect', error)
 
   # Clean up client resources when it is disconnected or the server did not
   # send heart beats in a timely fashion
   #
   # @private
   _cleanUp: () ->
+    # Clear if a reconnection was scheduled
+    clearTimeout @_reconnector if @_reconnector
+
     @connected = false
     @subscriptions = {}
     @partial = ''
